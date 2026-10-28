@@ -21,7 +21,7 @@ The problem: Claude Code sends *entire* screen redraws in these sync blocks - of
 claude-chill sits between your terminal and Claude Code:
 
 1. **Intercepts sync blocks** - Catches those massive atomic updates
-2. **VT-based rendering** - Uses a VT100 emulator to track screen state and renders only the differences
+2. **VT-based rendering** - Uses a VT100 emulator to track screen state and renders only the differences; rows that scroll off the emulator's screen scroll off your terminal's screen the same way, so your native scrollback grows with the conversation and what you are reading above the live rows stays put
 3. **Preserves history** - The emulator keeps every row that scrolled off its screen
 4. **Enables lookback** - Press a key to pause Claude and write that history into your terminal's scrollback
 5. **Settles resizes** - A drag is forwarded to Claude once it stops, then the scrollback is rewritten clean
@@ -67,7 +67,7 @@ Options:
   -r, --resize-refresh <RESIZE_REFRESH>
           Rewrite the terminal scrollback from the emulator this many ms after a resize settles, 0 to disable (default: 500)
   -s, --startup-refresh <STARTUP_REFRESH>
-          Once after startup, rewrite the terminal scrollback from the emulator when its history has grown and then stayed unchanged this many ms, 0 to disable (default: 1000)
+          Once after startup, rewrite the terminal scrollback from the emulator when its history has grown and then stayed unchanged this many ms, 0 to disable (default: 0, the live rendering already scrolls history into the terminal)
   -h, --help
           Print help
   -V, --version
@@ -117,13 +117,14 @@ After `auto_lookback_timeout_ms` (default 15 seconds) of idle (no user input), t
 
 ## Scrollback Refresh
 
-The live rendering only repaints the visible rows, so nothing reaches your terminal's own scrollback by itself. The history is written there, as one clean copy, on three occasions:
+The live rendering scrolls rows into your terminal's own scrollback as they leave the emulator's screen, in the state they left in, and repaints in place only what changed on the screen. So the native scrollback normally holds the conversation as it happened. It is rewritten wholesale, as one clean copy, on these occasions:
 
 - **Lookback** (the key above), on demand.
-- **Once after startup**: when the emulator's history has grown (a resumed session prints its transcript) and then stayed unchanged for `startup_refresh_ms` (default 1000). A spinner does not grow the history, so it does not delay this. Set it to 0 to disable.
 - **After a resize**: window resizes are forwarded to Claude only once they settle (150 ms without a change), so a drag causes one repaint. `resize_refresh_ms` (default 500) after that, once Claude's output has gone quiet or at the latest 1.5 s later, the scrollback is rewritten at the new size. Set it to 0 to disable.
 
-The emulator keeps old rows at the width they were rendered: when the terminal is narrower than those rows, your terminal wraps them. A rewrite replaces the whole scrollback, so it is not done while you may be reading it, which is why there is no periodic refresh.
+- **Once after startup**, optionally: `startup_refresh_ms` (default 0, off) rewrites the scrollback when the emulator's history has grown and then stayed unchanged that long. The live rendering already scrolls a resumed session's transcript in, so this is only for terminals where that does not work out.
+
+The emulator keeps old rows at the width they were rendered: when the terminal is narrower than those rows, your terminal wraps them. A rewrite replaces the whole scrollback, so it is not done while you may be reading it, which is why there is no periodic refresh. Once the emulator's scrollback is full (`history_lines`), the number of rows that scrolled is unknown and the screen is repainted in place until the next rewrite.
 
 ## Configuration
 
@@ -137,7 +138,7 @@ lookback_key = "[ctrl][6]"       # Key to toggle lookback mode
 refresh_rate = 20                # Rendering FPS
 auto_lookback_timeout_ms = 15000 # Auto-lookback after 15s idle (0 to disable)
 resize_refresh_ms = 500          # Rewrite the scrollback this long after a resize settles (0 to disable)
-startup_refresh_ms = 1000        # Rewrite it once after startup, this long after the history stops growing (0 to disable)
+startup_refresh_ms = 0           # Rewrite it once after startup, this long after the history stops growing (0 = off)
 ```
 
 ### Kitty Keyboard Protocol

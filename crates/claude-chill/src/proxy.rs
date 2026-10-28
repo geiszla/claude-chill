@@ -68,7 +68,7 @@ impl Default for ProxyConfig {
             lookback_sequence_kitty: b"\x1b[54;5u".to_vec(),
             auto_lookback_timeout_ms: 15000,
             resize_refresh_ms: 500,
-            startup_refresh_ms: 1000,
+            startup_refresh_ms: 0,
         }
     }
 }
@@ -109,7 +109,10 @@ pub struct Proxy {
     history: LineBuffer,
     history_filter: HistoryFilter,
     vt_parser: vt100::Parser,
-    vt_prev_screen: Option<vt100::Screen>,
+    /// What the terminal shows: the live output is fed to it as it is written
+    shadow: vt100::Parser,
+    force_full_render: bool,
+    scrollback_rows_at_render: usize,
     last_output_time: Option<Instant>,
     last_render_time: Option<Instant>,
     last_stdin_time: Option<Instant>,
@@ -305,7 +308,9 @@ impl Proxy {
             child,
             original_termios: terminal_guard.take(),
             vt_parser,
-            vt_prev_screen: None,
+            shadow: vt100::Parser::new(winsize.ws_row, winsize.ws_col, 0),
+            force_full_render: true,
+            scrollback_rows_at_render: 0,
             last_output_time: None,
             last_render_time: None,
             last_stdin_time: None,
@@ -560,7 +565,7 @@ impl Proxy {
 
             // Force full VT render to restore main screen content
             debug!("process_output_alt_screen: rendering VT screen after alt exit");
-            self.vt_prev_screen = None;
+            self.force_full_render = true;
             self.render_vt_screen(stdout_fd)?;
 
             // Data after ALT_EXIT was already fed to VT and history when we processed
@@ -767,30 +772,43 @@ impl Proxy {
     }
 
     fn render_vt_screen<F: AsFd>(&mut self, stdout_fd: &F) -> Result<()> {
-        let is_diff = self.vt_prev_screen.is_some();
+        let (rows, cols) = self.vt_parser.screen().size();
+        let scrolled = self.scrollback_rows();
+        let full = self.force_full_render;
         self.output_buffer.clear();
         self.output_buffer.extend_from_slice(SYNC_START);
 
-        match &self.vt_prev_screen {
-            Some(prev) => {
-                // Diff-based render: only send changes
-                self.output_buffer
-                    .extend_from_slice(&self.vt_parser.screen().contents_diff(prev));
+        if full {
+            self.force_full_render = false;
+            let frame = self.vt_parser.screen().contents_formatted();
+            self.shadow.process(&frame);
+            self.output_buffer.extend_from_slice(&frame);
+        } else {
+            // Rows that left the emulator's screen since the last render leave the
+            // terminal's screen the same way, so its scrollback grows with the
+            // conversation and what was above the live rows stays put. Once the
+            // emulator's scrollback is full the count is unknown, so the screen is
+            // repainted in place instead.
+            let k = scrolled.saturating_sub(self.scrollback_rows_at_render);
+            if k > 0 && scrolled < self.config.max_history_lines {
+                let scroll = self.mirror_scroll(k, usize::from(rows), cols);
+                self.shadow.process(&scroll);
+                self.output_buffer.extend_from_slice(&scroll);
             }
-            None => {
-                // First render: full screen
-                self.output_buffer
-                    .extend_from_slice(&self.vt_parser.screen().contents_formatted());
-            }
+            let diff = self.vt_parser.screen().contents_diff(self.shadow.screen());
+            self.shadow.process(&diff);
+            self.output_buffer.extend_from_slice(&diff);
         }
 
-        self.output_buffer
-            .extend_from_slice(&self.vt_parser.screen().cursor_state_formatted());
+        let cursor = self.vt_parser.screen().cursor_state_formatted();
+        self.shadow.process(&cursor);
+        self.output_buffer.extend_from_slice(&cursor);
         self.output_buffer.extend_from_slice(SYNC_END);
 
         debug!(
-            "render_vt_screen: diff={} output_len={}\n",
-            is_diff,
+            "render_vt_screen: full={} scrolled={} output_len={}\n",
+            full,
+            scrolled,
             self.output_buffer.len()
         );
         // Can't use write_to_terminal here due to borrow checker - can't pass
@@ -803,11 +821,41 @@ impl Proxy {
         );
         write_all(stdout_fd, &self.output_buffer)?;
 
-        // Store current screen for next diff
-        self.vt_prev_screen = Some(self.vt_parser.screen().clone());
+        self.scrollback_rows_at_render = scrolled;
         self.vt_render_pending = false;
         self.last_render_time = Some(Instant::now());
         Ok(())
+    }
+
+    /// Terminal bytes that scroll `k` rows out of the screen the way the emulator did:
+    /// the leaving rows are first brought to the state they left in, then each scroll
+    /// step writes the row that enters at the bottom
+    fn mirror_scroll(&mut self, k: usize, n: usize, cols: u16) -> Vec<u8> {
+        let total = self.scrollback_rows() + n;
+        let tail = self.stream_rows(total - (k + n), cols);
+        let shadow_rows: Vec<Vec<u8>> = self
+            .shadow
+            .screen()
+            .rows_formatted(0, cols)
+            .map(|row| row.strip_prefix(b"\r\n").unwrap_or(&row).to_vec())
+            .collect();
+        let mut out = Vec::new();
+        for i in 0..k.min(n) {
+            if tail[i] != shadow_rows[i] {
+                out.extend_from_slice(format!("\x1b[{};1H\x1b[2K", i + 1).as_bytes());
+                out.extend_from_slice(&tail[i]);
+                out.extend_from_slice(b"\x1b[m");
+            }
+        }
+        out.extend_from_slice(format!("\x1b[{n};1H").as_bytes());
+        tail[n..n + k].iter().for_each(|incoming| {
+            out.extend_from_slice(b"\r\n");
+            if !incoming.is_empty() {
+                out.extend_from_slice(incoming);
+                out.extend_from_slice(b"\x1b[m");
+            }
+        });
+        out
     }
 
     /// Rows the emulator holds above its screen
@@ -900,34 +948,31 @@ impl Proxy {
         Ok(())
     }
 
-    /// The emulator's scrollback plus the live screen, formatted, one line per row.
-    /// Claude Code repaints in place (cursor home, erase each row), so the emulator
-    /// holds each row once as last rendered, unlike the raw byte history, which
-    /// replays every partial repaint.
-    fn history_snapshot(&mut self) -> Vec<u8> {
+    /// Formatted rows of the emulator's scrollback followed by its screen, from the
+    /// given index on. Off-screen rows keep the width they were rendered at (the
+    /// emulator does not reflow); a width of `u16::MAX` emits all their cells so the
+    /// terminal wraps them
+    fn stream_rows(&mut self, from: usize, width: u16) -> Vec<Vec<u8>> {
         let rows = usize::from(self.vt_parser.screen().size().0);
         let screen = self.vt_parser.screen_mut();
         screen.set_scrollback(usize::MAX);
         let top = screen.scrollback();
         let mut out = Vec::new();
-        let mut emitted = 0;
-        let mut offset = top;
+        let mut offset = top.saturating_sub(from);
+        let mut next = top - offset;
         loop {
             screen.set_scrollback(offset);
             let first = top - offset;
-            // Off-screen rows keep the width they were rendered at (the emulator does
-            // not reflow); emitting all their cells lets the terminal wrap them
-            for (i, row) in screen.rows_formatted(0, u16::MAX).enumerate() {
-                if first + i < emitted {
+            for (i, row) in screen.rows_formatted(0, width).enumerate() {
+                let index = first + i;
+                if index < next {
                     continue;
                 }
-                if emitted > 0 {
-                    out.extend_from_slice(b"\r\n");
+                next = index + 1;
+                if index >= from {
+                    // A wrapped continuation row starts with its own line break
+                    out.push(row.strip_prefix(b"\r\n").unwrap_or(&row).to_vec());
                 }
-                // A wrapped continuation row starts with its own line break
-                out.extend_from_slice(row.strip_prefix(b"\r\n").unwrap_or(&row));
-                out.extend_from_slice(b"\x1b[m");
-                emitted += 1;
             }
             if offset == 0 {
                 break;
@@ -935,6 +980,22 @@ impl Proxy {
             offset = offset.saturating_sub(rows);
         }
         screen.set_scrollback(0);
+        out
+    }
+
+    /// The emulator's scrollback plus the live screen, one line per row. Claude Code
+    /// repaints in place (cursor home, erase each row), so the emulator holds each row
+    /// once as last rendered, unlike the raw byte history, which replays every
+    /// partial repaint.
+    fn history_snapshot(&mut self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.stream_rows(0, u16::MAX).iter().for_each(|row| {
+            if !out.is_empty() {
+                out.extend_from_slice(b"\r\n");
+            }
+            out.extend_from_slice(row);
+            out.extend_from_slice(b"\x1b[m");
+        });
         out
     }
 
@@ -970,7 +1031,7 @@ impl Proxy {
         // The terminal shows the snapshot's tail, which is the live screen; repaint it
         // in place (a full render starts with home + erase below) so later diffs start
         // from a known state
-        self.vt_prev_screen = None;
+        self.force_full_render = true;
         self.render_vt_screen(stdout_fd)
     }
 
@@ -1187,7 +1248,7 @@ impl Proxy {
         // home + erase below, which also removes the banner when the history is
         // shorter than the screen
         debug!("exit_lookback_mode: rendering VT screen");
-        self.vt_prev_screen = None;
+        self.force_full_render = true;
         self.render_vt_screen(stdout_fd)?;
 
         Ok(())
@@ -1203,8 +1264,11 @@ impl Proxy {
             self.vt_parser
                 .screen_mut()
                 .set_size(winsize.ws_row, winsize.ws_col);
+            self.shadow
+                .screen_mut()
+                .set_size(winsize.ws_row, winsize.ws_col);
             // Force full render on next frame since size changed
-            self.vt_prev_screen = None;
+            self.force_full_render = true;
             // Forward to child process
             unsafe {
                 libc::ioctl(

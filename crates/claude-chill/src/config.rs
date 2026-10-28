@@ -7,7 +7,7 @@ const DEFAULT_LOOKBACK_KEY: &str = "[ctrl][6]";
 const DEFAULT_REFRESH_RATE: u64 = 20;
 const DEFAULT_AUTO_LOOKBACK_TIMEOUT_MS: u64 = 15000;
 const DEFAULT_RESIZE_REFRESH_MS: u64 = 500;
-const DEFAULT_STARTUP_REFRESH_MS: u64 = 1000;
+const DEFAULT_STARTUP_REFRESH_MS: u64 = 0;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
