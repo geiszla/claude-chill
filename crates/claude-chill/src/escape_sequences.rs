@@ -3,6 +3,7 @@ pub const SYNC_END: &[u8] = b"\x1b[?2026l";
 pub const CLEAR_SCREEN: &[u8] = b"\x1b[2J";
 pub const CLEAR_SCROLLBACK: &[u8] = b"\x1b[3J";
 pub const CURSOR_HOME: &[u8] = b"\x1b[H";
+pub const ERASE_BELOW: &[u8] = b"\x1b[J";
 
 pub const ALT_SCREEN_ENTER: &[u8] = b"\x1b[?1049h";
 pub const ALT_SCREEN_EXIT: &[u8] = b"\x1b[?1049l";

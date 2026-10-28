@@ -1,8 +1,8 @@
 use crate::escape_sequences::{
     ALT_SCREEN_ENTER, ALT_SCREEN_ENTER_LEGACY, ALT_SCREEN_EXIT, ALT_SCREEN_EXIT_LEGACY,
     BRACKETED_PASTE_DISABLE, BRACKETED_PASTE_ENABLE, BRACKETED_PASTE_END, BRACKETED_PASTE_START,
-    CLEAR_SCREEN, CLEAR_SCROLLBACK, CURSOR_HOME, INPUT_BUFFER_CAPACITY, OUTPUT_BUFFER_CAPACITY,
-    SYNC_BUFFER_CAPACITY, SYNC_END, SYNC_START,
+    CLEAR_SCREEN, CLEAR_SCROLLBACK, CURSOR_HOME, ERASE_BELOW, INPUT_BUFFER_CAPACITY,
+    OUTPUT_BUFFER_CAPACITY, SYNC_BUFFER_CAPACITY, SYNC_END, SYNC_START,
 };
 use crate::history_filter::HistoryFilter;
 use crate::line_buffer::LineBuffer;
@@ -912,10 +912,12 @@ impl Proxy {
             debug!("Failed to write history file: {}", e);
         }
 
-        // Wipe the terminal's own scrollback too, so the snapshot is its only copy
-        self.write_to_terminal(stdout_fd, CLEAR_SCREEN)?;
-        self.write_to_terminal(stdout_fd, CLEAR_SCROLLBACK)?;
+        // Erase the screen in place and wipe the terminal's own scrollback, so the
+        // snapshot is its only copy. Not ESC[2J: VS Code's terminal scrolls the screen
+        // into the scrollback on that instead of erasing it.
         self.write_to_terminal(stdout_fd, CURSOR_HOME)?;
+        self.write_to_terminal(stdout_fd, ERASE_BELOW)?;
+        self.write_to_terminal(stdout_fd, CLEAR_SCROLLBACK)?;
         // Can't use write_to_terminal here due to borrow checker - can't pass
         // &self.output_buffer while also taking &mut self
         Self::update_kitty_mode_helper(
@@ -927,9 +929,8 @@ impl Proxy {
         write_all(stdout_fd, &self.output_buffer)?;
 
         // The terminal shows the snapshot's tail, which is the live screen; repaint it
-        // in place so later diffs start from a known state
-        self.write_to_terminal(stdout_fd, CLEAR_SCREEN)?;
-        self.write_to_terminal(stdout_fd, CURSOR_HOME)?;
+        // in place (a full render starts with home + erase below) so later diffs start
+        // from a known state
         self.vt_prev_screen = None;
         self.render_vt_screen(stdout_fd)
     }
@@ -1111,9 +1112,9 @@ impl Proxy {
             self.config.lookback_key
         );
         let stdout_fd = io::stdout();
-        write_all(&stdout_fd, CLEAR_SCREEN)?;
-        write_all(&stdout_fd, CLEAR_SCROLLBACK)?;
         write_all(&stdout_fd, CURSOR_HOME)?;
+        write_all(&stdout_fd, ERASE_BELOW)?;
+        write_all(&stdout_fd, CLEAR_SCROLLBACK)?;
         write_all(&stdout_fd, banner.as_bytes())?;
         write_all(&stdout_fd, &snapshot)?;
 
@@ -1143,11 +1144,10 @@ impl Proxy {
 
         self.forward_winsize()?;
 
-        // Force full render since terminal was showing history. Clear first: with a
-        // history shorter than the screen the banner and a stale row would remain.
+        // Force full render since terminal was showing history; it starts with
+        // home + erase below, which also removes the banner when the history is
+        // shorter than the screen
         debug!("exit_lookback_mode: rendering VT screen");
-        self.write_to_terminal(stdout_fd, CLEAR_SCREEN)?;
-        self.write_to_terminal(stdout_fd, CURSOR_HOME)?;
         self.vt_prev_screen = None;
         self.render_vt_screen(stdout_fd)?;
 
