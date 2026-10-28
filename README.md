@@ -22,8 +22,9 @@ claude-chill sits between your terminal and Claude Code:
 
 1. **Intercepts sync blocks** - Catches those massive atomic updates
 2. **VT-based rendering** - Uses a VT100 emulator to track screen state and renders only the differences
-3. **Preserves history** - Accumulates content in a buffer for lookback
-4. **Enables lookback** - Press a key to pause Claude and view the full history buffer
+3. **Preserves history** - The emulator keeps every row that scrolled off its screen
+4. **Enables lookback** - Press a key to pause Claude and write that history into your terminal's scrollback
+5. **Settles resizes** - A drag is forwarded to Claude once it stops, then the scrollback is rewritten clean
 
 ## Installation
 
@@ -63,6 +64,8 @@ Options:
           Key to toggle lookback mode, quote to prevent glob expansion (default: "[ctrl][6]")
   -a, --auto-lookback-timeout <AUTO_LOOKBACK_TIMEOUT>
           Auto-lookback timeout in ms, 0 to disable (default: 15000)
+  -r, --resize-refresh <RESIZE_REFRESH>
+          Rewrite the terminal scrollback from the emulator this many ms after a resize settles, 0 to disable (default: 500)
   -h, --help
           Print help
   -V, --version
@@ -98,17 +101,21 @@ Press `Ctrl+6` (or your configured key) to enter lookback mode:
 > **macOS Note:** Some Mac terminals don't send control characters for `Ctrl+number` keys.`Ctrl+Shift+6` (i.e., `Ctrl+^`) will work by default, or the lookback key can be customized.
 
 1. **Claude pauses** - Output from Claude is cached, input is blocked
-2. **History dumps** - The full history buffer is written to your terminal
-3. **Scroll freely** - Use your terminal's scrollback to review everything
+2. **History dumps** - Your terminal's scrollback is wiped and replaced with the emulator's history: every row that scrolled off the screen plus the screen itself, each row once, as last rendered
+3. **Scroll freely** - Use your terminal's scrollback and search to review everything
 4. **Exit** - Press the lookback key again or `Ctrl+C` to resume
 
-When you exit lookback mode, any cached output is processed and the current state is displayed.
+When you exit lookback mode, any cached output is processed and the live screen is repainted over the end of the dump, so the dump stays in your scrollback until the next one.
+
+Claude Code repaints by moving the cursor home and rewriting the visible rows, so the emulator's history holds no partial repaints. What it cannot undo is Claude's own repaint after a resize, which re-emits the rows around the old screen boundary at the new width: expect a seam of a few duplicated lines per resize.
 
 ## Auto-Lookback
 
-After `auto_lookback_timeout_ms` (default 15 seconds) of idle (no user input), the full history is automatically dumped to your terminal so you can scroll back without pressing any keys. This continues to re-dump every `auto_lookback_timeout_ms` while idle. This is useful for reviewing Claude's output after it finishes working.
+After `auto_lookback_timeout_ms` (default 15 seconds) of idle (no user input), the history is automatically dumped to your terminal so you can scroll back without pressing any keys. This continues to re-dump every `auto_lookback_timeout_ms` while idle, whenever there was new output. Each dump wipes the scrollback and rewrites it, which moves what you were reading, so turn it off with `-a 0` if you scroll while Claude works.
 
-**Note:** The auto-lookback causes a brief screen flicker during the transition as it clears the screen and writes the history buffer. Disable with `-a 0` or adjust the timeout with `-a 30000` (30 seconds).
+## Resize Refresh
+
+Window resizes are forwarded to Claude only once they settle (150 ms without a change), so a drag causes one repaint. `resize_refresh_ms` (default 500) after that, once Claude's output has gone quiet, the scrollback is wiped and rewritten from the emulator, which gives you one clean copy of the history at the new size. Set it to 0 to disable. The emulator keeps old rows at the width they were rendered: when the terminal is narrower than those rows, your terminal wraps them.
 
 ## Configuration
 
@@ -117,13 +124,12 @@ Config file location:
 - **macOS**: `~/Library/Application Support/claude-chill.toml`
 
 ```toml
-history_lines = 100000           # Max lines stored for lookback
+history_lines = 100000           # Max rows the emulator keeps off-screen (each row costs about 32 bytes per column)
 lookback_key = "[ctrl][6]"       # Key to toggle lookback mode
 refresh_rate = 20                # Rendering FPS
 auto_lookback_timeout_ms = 15000 # Auto-lookback after 15s idle (0 to disable)
+resize_refresh_ms = 500          # Rewrite the scrollback this long after a resize settles (0 to disable)
 ```
-
-Note: History is cleared on full screen redraws, so lookback shows output since Claude's last full render.
 
 ### Kitty Keyboard Protocol
 
@@ -163,8 +169,8 @@ claude-chill creates a pseudo-terminal (PTY) and spawns Claude Code as a child p
 2. **Output processing**: Scans output for sync block markers. Non-sync output passes through directly
 3. **VT emulation**: Feeds output through a VT100 emulator to track the virtual screen state
 4. **Differential rendering**: Compares current screen to previous and emits only the changes
-5. **History tracking**: Maintains a buffer of output for lookback mode since the last full redraw
-6. **Signal forwarding**: Window resize (SIGWINCH), interrupt (SIGINT), and terminate (SIGTERM) signals are forwarded to Claude
+5. **History tracking**: The emulator's scrollback is the history; lookback and the resize refresh write it out row by row
+6. **Signal forwarding**: Window resize (SIGWINCH, debounced), interrupt (SIGINT), and terminate (SIGTERM) signals are forwarded to Claude
 
 ## Installation with Nix
 

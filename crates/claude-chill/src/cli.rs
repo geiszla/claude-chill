@@ -27,4 +27,8 @@ pub struct Cli {
     /// Auto-lookback timeout in ms, 0 to disable (default: 15000)
     #[arg(short = 'a', long = "auto-lookback-timeout")]
     pub auto_lookback_timeout: Option<u64>,
+
+    /// Rewrite the terminal scrollback from the emulator this many ms after a resize settles, 0 to disable (default: 500)
+    #[arg(short = 'r', long = "resize-refresh")]
+    pub resize_refresh: Option<u64>,
 }

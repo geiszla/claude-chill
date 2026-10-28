@@ -1,8 +1,8 @@
 use crate::escape_sequences::{
     ALT_SCREEN_ENTER, ALT_SCREEN_ENTER_LEGACY, ALT_SCREEN_EXIT, ALT_SCREEN_EXIT_LEGACY,
     BRACKETED_PASTE_DISABLE, BRACKETED_PASTE_ENABLE, BRACKETED_PASTE_END, BRACKETED_PASTE_START,
-    CLEAR_SCREEN, CURSOR_HOME, INPUT_BUFFER_CAPACITY, OUTPUT_BUFFER_CAPACITY, SYNC_BUFFER_CAPACITY,
-    SYNC_END, SYNC_START,
+    CLEAR_SCREEN, CLEAR_SCROLLBACK, CURSOR_HOME, INPUT_BUFFER_CAPACITY, OUTPUT_BUFFER_CAPACITY,
+    SYNC_BUFFER_CAPACITY, SYNC_END, SYNC_START,
 };
 use crate::history_filter::HistoryFilter;
 use crate::line_buffer::LineBuffer;
@@ -55,6 +55,7 @@ pub struct ProxyConfig {
     pub lookback_sequence_legacy: Vec<u8>,
     pub lookback_sequence_kitty: Vec<u8>,
     pub auto_lookback_timeout_ms: u64,
+    pub resize_refresh_ms: u64,
 }
 
 impl Default for ProxyConfig {
@@ -65,6 +66,7 @@ impl Default for ProxyConfig {
             lookback_sequence_legacy: vec![0x1E],
             lookback_sequence_kitty: b"\x1b[54;5u".to_vec(),
             auto_lookback_timeout_ms: 15000,
+            resize_refresh_ms: 500,
         }
     }
 }
@@ -94,6 +96,7 @@ impl Drop for TerminalGuard {
 
 const RENDER_DELAY_MS: u64 = 5;
 const SYNC_BLOCK_DELAY_MS: u64 = 50;
+const RESIZE_DEBOUNCE_MS: u64 = 150;
 
 pub struct Proxy {
     config: ProxyConfig,
@@ -109,6 +112,9 @@ pub struct Proxy {
     last_stdin_time: Option<Instant>,
     last_auto_lookback_time: Option<Instant>,
     auto_lookback_timeout: Duration,
+    winch_pending_since: Option<Instant>,
+    resize_refresh_due: Option<Instant>,
+    resize_refresh_delay: Duration,
     sync_buffer: Vec<u8>,
     in_sync_block: bool,
     in_lookback_mode: bool,
@@ -270,7 +276,8 @@ impl Proxy {
         let stdout_fd = io::stdout();
         write_all(&stdout_fd, BRACKETED_PASTE_ENABLE)?;
 
-        let vt_parser = vt100::Parser::new(winsize.ws_row, winsize.ws_col, 0);
+        let vt_parser =
+            vt100::Parser::new(winsize.ws_row, winsize.ws_col, config.max_history_lines);
 
         // Seed history with clear screen so replay starts fresh
         let mut history = LineBuffer::new(config.max_history_lines);
@@ -278,6 +285,7 @@ impl Proxy {
         history.push_bytes(CURSOR_HOME);
 
         let auto_lookback_timeout = Duration::from_millis(config.auto_lookback_timeout_ms);
+        let resize_refresh_delay = Duration::from_millis(config.resize_refresh_ms);
 
         debug!("Proxy::spawn: command={} args={:?}", command, args);
 
@@ -295,6 +303,9 @@ impl Proxy {
             last_stdin_time: None,
             last_auto_lookback_time: None,
             auto_lookback_timeout,
+            winch_pending_since: None,
+            resize_refresh_due: None,
+            resize_refresh_delay,
             sync_buffer: Vec::with_capacity(SYNC_BUFFER_CAPACITY),
             in_sync_block: false,
             in_lookback_mode: false,
@@ -330,7 +341,18 @@ impl Proxy {
 
         loop {
             if SIGWINCH_RECEIVED.swap(false, Ordering::SeqCst) {
+                self.winch_pending_since = Some(Instant::now());
+            }
+            // A drag fires many resizes. The child only gets the settled size, so it
+            // repaints once and leaves one seam in the history instead of one per event.
+            if let Some(since) = self.winch_pending_since
+                && since.elapsed() >= Duration::from_millis(RESIZE_DEBOUNCE_MS)
+            {
+                self.winch_pending_since = None;
                 self.forward_winsize()?;
+                if !self.resize_refresh_delay.is_zero() {
+                    self.resize_refresh_due = Some(Instant::now() + self.resize_refresh_delay);
+                }
             }
             if SIGINT_RECEIVED.swap(false, Ordering::SeqCst) {
                 self.forward_signal(Signal::SIGINT);
@@ -356,6 +378,7 @@ impl Proxy {
                 Ok(0) => {
                     self.flush_pending_vt_render(&stdout_fd)?;
                     self.check_auto_lookback(&stdout_fd)?;
+                    self.check_resize_refresh(&stdout_fd)?;
                     continue;
                 }
                 Ok(_) => {}
@@ -767,6 +790,31 @@ impl Proxy {
         Ok(())
     }
 
+    /// After a settled resize, once the child's repaint has gone quiet, rewrite the
+    /// terminal scrollback from the emulator so it holds one reflowed copy of the history
+    fn check_resize_refresh<F: AsFd>(&mut self, stdout_fd: &F) -> Result<()> {
+        let Some(due) = self.resize_refresh_due else {
+            return Ok(());
+        };
+        if Instant::now() < due
+            || self.in_lookback_mode
+            || self.in_alternate_screen
+            || self.in_sync_block
+            || self.winch_pending_since.is_some()
+        {
+            return Ok(());
+        }
+        if self
+            .last_output_time
+            .is_some_and(|t| t.elapsed() < Duration::from_millis(RESIZE_DEBOUNCE_MS))
+        {
+            return Ok(());
+        }
+        self.resize_refresh_due = None;
+        debug!("resize refresh: rewriting scrollback from the emulator");
+        self.dump_history(stdout_fd)
+    }
+
     fn check_auto_lookback<F: AsFd>(&mut self, stdout_fd: &F) -> Result<()> {
         if self.auto_lookback_timeout.is_zero() {
             return Ok(());
@@ -809,14 +857,49 @@ impl Proxy {
         Ok(())
     }
 
+    /// The emulator's scrollback plus the live screen, formatted, one line per row.
+    /// Claude Code repaints in place (cursor home, erase each row), so the emulator
+    /// holds each row once as last rendered, unlike the raw byte history, which
+    /// replays every partial repaint.
+    fn history_snapshot(&mut self) -> Vec<u8> {
+        let rows = usize::from(self.vt_parser.screen().size().0);
+        let screen = self.vt_parser.screen_mut();
+        screen.set_scrollback(usize::MAX);
+        let top = screen.scrollback();
+        let mut out = Vec::new();
+        let mut emitted = 0;
+        let mut offset = top;
+        loop {
+            screen.set_scrollback(offset);
+            let first = top - offset;
+            // Off-screen rows keep the width they were rendered at (the emulator does
+            // not reflow); emitting all their cells lets the terminal wrap them
+            for (i, row) in screen.rows_formatted(0, u16::MAX).enumerate() {
+                if first + i < emitted {
+                    continue;
+                }
+                if emitted > 0 {
+                    out.extend_from_slice(b"\r\n");
+                }
+                // A wrapped continuation row starts with its own line break
+                out.extend_from_slice(row.strip_prefix(b"\r\n").unwrap_or(&row));
+                out.extend_from_slice(b"\x1b[m");
+                emitted += 1;
+            }
+            if offset == 0 {
+                break;
+            }
+            offset = offset.saturating_sub(rows);
+        }
+        screen.set_scrollback(0);
+        out
+    }
+
     fn dump_history<F: AsFd>(&mut self, stdout_fd: &F) -> Result<()> {
-        debug!(
-            "dump_history: history_bytes={} lines={}",
-            self.history.total_bytes(),
-            self.history.line_count()
-        );
+        let snapshot = self.history_snapshot();
+        debug!("dump_history: snapshot_bytes={}", snapshot.len());
         self.output_buffer.clear();
-        self.history.append_all(&mut self.output_buffer);
+        self.output_buffer.extend_from_slice(&snapshot);
 
         // Debug: write history to file if CLAUDE_CHILL_HISTORY_FILE is set
         if let Ok(path) = std::env::var("CLAUDE_CHILL_HISTORY_FILE")
@@ -825,7 +908,9 @@ impl Proxy {
             debug!("Failed to write history file: {}", e);
         }
 
+        // Wipe the terminal's own scrollback too, so the snapshot is its only copy
         self.write_to_terminal(stdout_fd, CLEAR_SCREEN)?;
+        self.write_to_terminal(stdout_fd, CLEAR_SCROLLBACK)?;
         self.write_to_terminal(stdout_fd, CURSOR_HOME)?;
         // Can't use write_to_terminal here due to borrow checker - can't pass
         // &self.output_buffer while also taking &mut self
@@ -837,9 +922,12 @@ impl Proxy {
         );
         write_all(stdout_fd, &self.output_buffer)?;
 
-        // Force full VT render on next output since terminal now shows history
+        // The terminal shows the snapshot's tail, which is the live screen; repaint it
+        // in place so later diffs start from a known state
+        self.write_to_terminal(stdout_fd, CLEAR_SCREEN)?;
+        self.write_to_terminal(stdout_fd, CURSOR_HOME)?;
         self.vt_prev_screen = None;
-        Ok(())
+        self.render_vt_screen(stdout_fd)
     }
 
     fn process_input<F: AsFd>(&mut self, data: &[u8], stdout_fd: &F) -> Result<()> {
@@ -1005,32 +1093,25 @@ impl Proxy {
     }
 
     fn enter_lookback_mode(&mut self) -> Result<()> {
-        debug!(
-            "enter_lookback_mode: history_bytes={} lines={}",
-            self.history.total_bytes(),
-            self.history.line_count()
-        );
         self.in_lookback_mode = true;
         self.lookback_cache.clear();
         self.vt_render_pending = false;
 
-        self.output_buffer.clear();
-        self.history.append_all(&mut self.output_buffer);
-        debug!(
-            "enter_lookback_mode: output_buffer_len={}",
-            self.output_buffer.len()
-        );
+        let snapshot = self.history_snapshot();
+        debug!("enter_lookback_mode: snapshot_bytes={}", snapshot.len());
 
-        let stdout_fd = io::stdout();
-        write_all(&stdout_fd, CLEAR_SCREEN)?;
-        write_all(&stdout_fd, CURSOR_HOME)?;
-        write_all(&stdout_fd, &self.output_buffer)?;
-
-        let exit_msg = format!(
-            "\r\n\x1b[7m--- LOOKBACK MODE: press {} or Ctrl+C to exit ---\x1b[0m\r\n",
+        // The banner goes above the history: ending on the last screen row keeps the
+        // terminal's visible rows aligned with the emulator for the repaint on exit
+        let banner = format!(
+            "\x1b[7m--- LOOKBACK MODE: press {} or Ctrl+C to exit ---\x1b[0m\r\n",
             self.config.lookback_key
         );
-        write_all(&stdout_fd, exit_msg.as_bytes())?;
+        let stdout_fd = io::stdout();
+        write_all(&stdout_fd, CLEAR_SCREEN)?;
+        write_all(&stdout_fd, CLEAR_SCROLLBACK)?;
+        write_all(&stdout_fd, CURSOR_HOME)?;
+        write_all(&stdout_fd, banner.as_bytes())?;
+        write_all(&stdout_fd, &snapshot)?;
 
         Ok(())
     }
@@ -1058,8 +1139,11 @@ impl Proxy {
 
         self.forward_winsize()?;
 
-        // Force full render since terminal was showing history
+        // Force full render since terminal was showing history. Clear first: with a
+        // history shorter than the screen the banner and a stale row would remain.
         debug!("exit_lookback_mode: rendering VT screen");
+        self.write_to_terminal(stdout_fd, CLEAR_SCREEN)?;
+        self.write_to_terminal(stdout_fd, CURSOR_HOME)?;
         self.vt_prev_screen = None;
         self.render_vt_screen(stdout_fd)?;
 
