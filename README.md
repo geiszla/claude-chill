@@ -157,6 +157,8 @@ Keys: `[a]`-`[z]`, `[f1]`-`[f12]`, `[pageup]`, `[pagedown]`, `[home]`, `[end]`, 
 
 **Note:** Quote the key value on the command line to prevent shell glob expansion: `-k "[ctrl][7]"`
 
+A key that starts with Esc (`[f12]`, `[esc]`) is matched byte by byte, so a lone Esc keypress is held for 50 ms before it is forwarded; Esc followed at once by another key (Alt+key) and escape sequences such as arrow keys pass through unchanged.
+
 ### Why Ctrl+6?
 
 `Ctrl+6` sends 0x1E (ASCII RS), a control character not frequently used by terminals, signals, or shells. Avoid `Ctrl+letter` hotkeys - terminals can't distinguish `Ctrl+J` from `Ctrl+Shift+J`.

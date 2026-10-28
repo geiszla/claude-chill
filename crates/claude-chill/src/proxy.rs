@@ -1,11 +1,9 @@
 use crate::escape_sequences::{
     ALT_SCREEN_ENTER, ALT_SCREEN_ENTER_LEGACY, ALT_SCREEN_EXIT, ALT_SCREEN_EXIT_LEGACY,
     BRACKETED_PASTE_DISABLE, BRACKETED_PASTE_ENABLE, BRACKETED_PASTE_END, BRACKETED_PASTE_START,
-    CLEAR_SCREEN, CLEAR_SCROLLBACK, CURSOR_HOME, ERASE_BELOW, INPUT_BUFFER_CAPACITY,
-    OUTPUT_BUFFER_CAPACITY, SYNC_BUFFER_CAPACITY, SYNC_END, SYNC_START,
+    CLEAR_SCROLLBACK, CURSOR_HOME, ERASE_BELOW, INPUT_BUFFER_CAPACITY, OUTPUT_BUFFER_CAPACITY,
+    SYNC_END, SYNC_START,
 };
-use crate::history_filter::HistoryFilter;
-use crate::line_buffer::LineBuffer;
 use anyhow::{Context, Result};
 use log::debug;
 use memchr::memmem;
@@ -100,14 +98,14 @@ const RENDER_DELAY_MS: u64 = 5;
 const SYNC_BLOCK_DELAY_MS: u64 = 50;
 const RESIZE_DEBOUNCE_MS: u64 = 150;
 const RESIZE_REFRESH_MAX_WAIT_MS: u64 = 1500;
+// A lone Esc is a prefix of an Esc-based lookback key; forward it after this long
+const LOOKBACK_HOLD_MS: u64 = 50;
 
 pub struct Proxy {
     config: ProxyConfig,
     pty_master: OwnedFd,
     child: Child,
     original_termios: Option<Termios>,
-    history: LineBuffer,
-    history_filter: HistoryFilter,
     vt_parser: vt100::Parser,
     /// What the terminal shows: the live output is fed to it as it is written
     shadow: vt100::Parser,
@@ -125,7 +123,6 @@ pub struct Proxy {
     startup_refresh_pending: bool,
     scrollback_rows_seen: usize,
     last_scrollback_growth: Option<Instant>,
-    sync_buffer: Vec<u8>,
     in_sync_block: bool,
     in_lookback_mode: bool,
     in_alternate_screen: bool,
@@ -136,11 +133,10 @@ pub struct Proxy {
     vt_render_pending: bool,
     lookback_cache: Vec<u8>,
     lookback_input_buffer: Vec<u8>,
+    lookback_hold_since: Option<Instant>,
     output_buffer: Vec<u8>,
     sync_start_finder: memmem::Finder<'static>,
     sync_end_finder: memmem::Finder<'static>,
-    clear_screen_finder: memmem::Finder<'static>,
-    cursor_home_finder: memmem::Finder<'static>,
     alt_screen_enter_finder: memmem::Finder<'static>,
     alt_screen_exit_finder: memmem::Finder<'static>,
     alt_screen_enter_legacy_finder: memmem::Finder<'static>,
@@ -290,10 +286,6 @@ impl Proxy {
             vt100::Parser::new(winsize.ws_row, winsize.ws_col, config.max_history_lines);
 
         // Seed history with clear screen so replay starts fresh
-        let mut history = LineBuffer::new(config.max_history_lines);
-        history.push_bytes(CLEAR_SCREEN);
-        history.push_bytes(CURSOR_HOME);
-
         let auto_lookback_timeout = Duration::from_millis(config.auto_lookback_timeout_ms);
         let resize_refresh_delay = Duration::from_millis(config.resize_refresh_ms);
         let startup_refresh_quiet = Duration::from_millis(config.startup_refresh_ms);
@@ -301,8 +293,6 @@ impl Proxy {
         debug!("Proxy::spawn: command={} args={:?}", command, args);
 
         Ok(Self {
-            history,
-            history_filter: HistoryFilter::new(),
             config,
             pty_master: pty.master,
             child,
@@ -323,7 +313,6 @@ impl Proxy {
             startup_refresh_pending: !startup_refresh_quiet.is_zero(),
             scrollback_rows_seen: 0,
             last_scrollback_growth: None,
-            sync_buffer: Vec::with_capacity(SYNC_BUFFER_CAPACITY),
             in_sync_block: false,
             in_lookback_mode: false,
             in_alternate_screen: false,
@@ -334,11 +323,10 @@ impl Proxy {
             vt_render_pending: false,
             lookback_cache: Vec::new(),
             lookback_input_buffer: Vec::with_capacity(INPUT_BUFFER_CAPACITY),
+            lookback_hold_since: None,
             output_buffer: Vec::with_capacity(OUTPUT_BUFFER_CAPACITY),
             sync_start_finder: memmem::Finder::new(SYNC_START),
             sync_end_finder: memmem::Finder::new(SYNC_END),
-            clear_screen_finder: memmem::Finder::new(CLEAR_SCREEN),
-            cursor_home_finder: memmem::Finder::new(CURSOR_HOME),
             alt_screen_enter_finder: memmem::Finder::new(ALT_SCREEN_ENTER),
             alt_screen_exit_finder: memmem::Finder::new(ALT_SCREEN_EXIT),
             alt_screen_enter_legacy_finder: memmem::Finder::new(ALT_SCREEN_ENTER_LEGACY),
@@ -374,6 +362,7 @@ impl Proxy {
             if SIGINT_RECEIVED.swap(false, Ordering::SeqCst) {
                 self.forward_signal(Signal::SIGINT);
             }
+            self.flush_held_input()?;
             if SIGTERM_RECEIVED.swap(false, Ordering::SeqCst) {
                 self.forward_signal(Signal::SIGTERM);
             }
@@ -386,10 +375,15 @@ impl Proxy {
                 PollFd::new(stdin_borrowed, PollFlags::POLLIN),
             ];
 
-            let poll_timeout_ms = self
+            let mut poll_timeout_ms = self
                 .time_until_render()
                 .map(|d| d.as_millis().min(100) as u16)
                 .unwrap_or(100);
+            if let Some(since) = self.lookback_hold_since {
+                let remaining =
+                    Duration::from_millis(LOOKBACK_HOLD_MS).saturating_sub(since.elapsed());
+                poll_timeout_ms = poll_timeout_ms.min(remaining.as_millis().max(1) as u16);
+            }
 
             match poll(&mut poll_fds, PollTimeout::from(poll_timeout_ms)) {
                 Ok(0) => {
@@ -503,16 +497,7 @@ impl Proxy {
                     "process_output: ALT_SCREEN_ENTER detected at pos={}",
                     pos + alt_pos
                 );
-                // Add ALL remaining data to history (including alt screen enter and content)
-                // This ensures history matches VT exactly
-                let remaining = &data[pos..];
-                if self.in_sync_block {
-                    self.sync_buffer.extend_from_slice(remaining);
-                    self.flush_sync_block_to_history();
-                    self.in_sync_block = false;
-                } else {
-                    self.push_to_history(remaining);
-                }
+                self.in_sync_block = false;
                 self.in_alternate_screen = true;
                 let seq_len = self.alt_screen_enter_len(&data[pos + alt_pos..]);
                 // Write alt screen enter directly
@@ -523,28 +508,16 @@ impl Proxy {
             if self.in_sync_block {
                 if let Some(idx) = self.sync_end_finder.find(&data[pos..]) {
                     debug!("process_output: SYNC_END at pos={}", pos + idx);
-                    self.sync_buffer.extend_from_slice(&data[pos..pos + idx]);
-                    self.sync_buffer.extend_from_slice(SYNC_END);
-                    self.flush_sync_block_to_history();
                     self.in_sync_block = false;
                     pos += idx + SYNC_END.len();
                 } else {
-                    self.sync_buffer.extend_from_slice(&data[pos..]);
                     break;
                 }
             } else if let Some(idx) = self.sync_start_finder.find(&data[pos..]) {
                 debug!("process_output: SYNC_START at pos={}", pos + idx);
-                // Add any data before SYNC_START to history
-                if idx > 0 {
-                    self.push_to_history(&data[pos..pos + idx]);
-                }
                 self.in_sync_block = true;
-                self.sync_buffer.clear();
-                self.sync_buffer.extend_from_slice(SYNC_START);
                 pos += idx + SYNC_START.len();
             } else {
-                // No sync block, just add to history
-                self.push_to_history(&data[pos..]);
                 break;
             }
         }
@@ -693,35 +666,6 @@ impl Proxy {
                 }
             }
         }
-    }
-
-    fn flush_sync_block_to_history(&mut self) {
-        let has_clear_screen = self.clear_screen_finder.find(&self.sync_buffer).is_some();
-        let has_cursor_home = self.cursor_home_finder.find(&self.sync_buffer).is_some();
-        let is_full_redraw = has_clear_screen && has_cursor_home;
-
-        debug!(
-            "flush_sync_block: len={} full_redraw={}",
-            self.sync_buffer.len(),
-            is_full_redraw
-        );
-
-        if is_full_redraw {
-            debug!("CLEARING HISTORY");
-            self.history.clear();
-            // Re-seed with clear screen after clearing
-            self.history.push_bytes(CLEAR_SCREEN);
-            self.history.push_bytes(CURSOR_HOME);
-        }
-        self.push_to_history(&self.sync_buffer.clone());
-        self.sync_buffer.clear();
-    }
-
-    /// Push data to history, filtering out terminal query sequences that would
-    /// cause the terminal to respond when replayed.
-    fn push_to_history(&mut self, data: &[u8]) {
-        let filtered = self.history_filter.filter(data);
-        self.history.push_bytes(&filtered);
     }
 
     fn flush_pending_vt_render<F: AsFd>(&mut self, stdout_fd: &F) -> Result<()> {
@@ -1174,6 +1118,24 @@ impl Proxy {
                 }
             }
         }
+        self.lookback_hold_since = (!self.lookback_input_buffer.is_empty()).then(Instant::now);
+        Ok(())
+    }
+
+    /// Input held back as a possible start of the lookback key is forwarded once no
+    /// more bytes follow it, so a lone Esc is not delayed until the next keypress
+    fn flush_held_input(&mut self) -> Result<()> {
+        let Some(since) = self.lookback_hold_since else {
+            return Ok(());
+        };
+        if since.elapsed() < Duration::from_millis(LOOKBACK_HOLD_MS) {
+            return Ok(());
+        }
+        if !self.in_lookback_mode {
+            write_all(&self.pty_master, &self.lookback_input_buffer)?;
+        }
+        self.lookback_input_buffer.clear();
+        self.lookback_hold_since = None;
         Ok(())
     }
 
@@ -1240,7 +1202,6 @@ impl Proxy {
 
         // Reset sync block state
         self.in_sync_block = false;
-        self.sync_buffer.clear();
 
         self.forward_winsize()?;
 
