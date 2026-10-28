@@ -57,6 +57,7 @@ fn main() -> ExitCode {
         .auto_lookback_timeout
         .unwrap_or(config.auto_lookback_timeout_ms);
     let resize_refresh_ms = cli.resize_refresh.unwrap_or(config.resize_refresh_ms);
+    let startup_refresh_ms = cli.startup_refresh.unwrap_or(config.startup_refresh_ms);
 
     let proxy_config = ProxyConfig {
         max_history_lines: history_lines,
@@ -65,6 +66,7 @@ fn main() -> ExitCode {
         lookback_sequence_kitty,
         auto_lookback_timeout_ms,
         resize_refresh_ms,
+        startup_refresh_ms,
     };
 
     let cmd_args: Vec<&str> = cli.args.iter().map(|s| s.as_str()).collect();

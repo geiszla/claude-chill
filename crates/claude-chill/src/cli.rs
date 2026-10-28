@@ -31,4 +31,8 @@ pub struct Cli {
     /// Rewrite the terminal scrollback from the emulator this many ms after a resize settles, 0 to disable (default: 500)
     #[arg(short = 'r', long = "resize-refresh")]
     pub resize_refresh: Option<u64>,
+
+    /// Once after startup, rewrite the terminal scrollback from the emulator when its history has grown and then stayed unchanged this many ms, 0 to disable (default: 1000)
+    #[arg(short = 's', long = "startup-refresh")]
+    pub startup_refresh: Option<u64>,
 }

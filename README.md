@@ -66,6 +66,8 @@ Options:
           Auto-lookback timeout in ms, 0 to disable (default: 15000)
   -r, --resize-refresh <RESIZE_REFRESH>
           Rewrite the terminal scrollback from the emulator this many ms after a resize settles, 0 to disable (default: 500)
+  -s, --startup-refresh <STARTUP_REFRESH>
+          Once after startup, rewrite the terminal scrollback from the emulator when its history has grown and then stayed unchanged this many ms, 0 to disable (default: 1000)
   -h, --help
           Print help
   -V, --version
@@ -113,9 +115,15 @@ Claude Code repaints by moving the cursor home and rewriting the visible rows, s
 
 After `auto_lookback_timeout_ms` (default 15 seconds) of idle (no user input), the history is automatically dumped to your terminal so you can scroll back without pressing any keys. This continues to re-dump every `auto_lookback_timeout_ms` while idle, whenever there was new output. Each dump wipes the scrollback and rewrites it, which moves what you were reading, so turn it off with `-a 0` if you scroll while Claude works.
 
-## Resize Refresh
+## Scrollback Refresh
 
-Window resizes are forwarded to Claude only once they settle (150 ms without a change), so a drag causes one repaint. `resize_refresh_ms` (default 500) after that, once Claude's output has gone quiet, the scrollback is wiped and rewritten from the emulator, which gives you one clean copy of the history at the new size. Set it to 0 to disable. The emulator keeps old rows at the width they were rendered: when the terminal is narrower than those rows, your terminal wraps them.
+The live rendering only repaints the visible rows, so nothing reaches your terminal's own scrollback by itself. The history is written there, as one clean copy, on three occasions:
+
+- **Lookback** (the key above), on demand.
+- **Once after startup**: when the emulator's history has grown (a resumed session prints its transcript) and then stayed unchanged for `startup_refresh_ms` (default 1000). A spinner does not grow the history, so it does not delay this. Set it to 0 to disable.
+- **After a resize**: window resizes are forwarded to Claude only once they settle (150 ms without a change), so a drag causes one repaint. `resize_refresh_ms` (default 500) after that, once Claude's output has gone quiet or at the latest 1.5 s later, the scrollback is rewritten at the new size. Set it to 0 to disable.
+
+The emulator keeps old rows at the width they were rendered: when the terminal is narrower than those rows, your terminal wraps them. A rewrite replaces the whole scrollback, so it is not done while you may be reading it, which is why there is no periodic refresh.
 
 ## Configuration
 
@@ -129,6 +137,7 @@ lookback_key = "[ctrl][6]"       # Key to toggle lookback mode
 refresh_rate = 20                # Rendering FPS
 auto_lookback_timeout_ms = 15000 # Auto-lookback after 15s idle (0 to disable)
 resize_refresh_ms = 500          # Rewrite the scrollback this long after a resize settles (0 to disable)
+startup_refresh_ms = 1000        # Rewrite it once after startup, this long after the history stops growing (0 to disable)
 ```
 
 ### Kitty Keyboard Protocol

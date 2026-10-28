@@ -56,6 +56,7 @@ pub struct ProxyConfig {
     pub lookback_sequence_kitty: Vec<u8>,
     pub auto_lookback_timeout_ms: u64,
     pub resize_refresh_ms: u64,
+    pub startup_refresh_ms: u64,
 }
 
 impl Default for ProxyConfig {
@@ -67,6 +68,7 @@ impl Default for ProxyConfig {
             lookback_sequence_kitty: b"\x1b[54;5u".to_vec(),
             auto_lookback_timeout_ms: 15000,
             resize_refresh_ms: 500,
+            startup_refresh_ms: 1000,
         }
     }
 }
@@ -116,6 +118,10 @@ pub struct Proxy {
     winch_pending_since: Option<Instant>,
     resize_refresh_due: Option<Instant>,
     resize_refresh_delay: Duration,
+    startup_refresh_quiet: Duration,
+    startup_refresh_pending: bool,
+    scrollback_rows_seen: usize,
+    last_scrollback_growth: Option<Instant>,
     sync_buffer: Vec<u8>,
     in_sync_block: bool,
     in_lookback_mode: bool,
@@ -287,6 +293,7 @@ impl Proxy {
 
         let auto_lookback_timeout = Duration::from_millis(config.auto_lookback_timeout_ms);
         let resize_refresh_delay = Duration::from_millis(config.resize_refresh_ms);
+        let startup_refresh_quiet = Duration::from_millis(config.startup_refresh_ms);
 
         debug!("Proxy::spawn: command={} args={:?}", command, args);
 
@@ -307,6 +314,10 @@ impl Proxy {
             winch_pending_since: None,
             resize_refresh_due: None,
             resize_refresh_delay,
+            startup_refresh_quiet,
+            startup_refresh_pending: !startup_refresh_quiet.is_zero(),
+            scrollback_rows_seen: 0,
+            last_scrollback_growth: None,
             sync_buffer: Vec::with_capacity(SYNC_BUFFER_CAPACITY),
             in_sync_block: false,
             in_lookback_mode: false,
@@ -379,7 +390,7 @@ impl Proxy {
                 Ok(0) => {
                     self.flush_pending_vt_render(&stdout_fd)?;
                     self.check_auto_lookback(&stdout_fd)?;
-                    self.check_resize_refresh(&stdout_fd)?;
+                    self.check_scrollback_refresh(&stdout_fd)?;
                     continue;
                 }
                 Ok(_) => {}
@@ -388,7 +399,7 @@ impl Proxy {
             }
 
             self.flush_pending_vt_render(&stdout_fd)?;
-            self.check_resize_refresh(&stdout_fd)?;
+            self.check_scrollback_refresh(&stdout_fd)?;
 
             if let Some(revents) = poll_fds[0].revents() {
                 if revents.contains(PollFlags::POLLIN) {
@@ -470,6 +481,13 @@ impl Proxy {
         }
         self.vt_render_pending = true;
         self.last_output_time = Some(Instant::now());
+        if self.startup_refresh_pending {
+            let rows = self.scrollback_rows();
+            if rows > self.scrollback_rows_seen {
+                self.scrollback_rows_seen = rows;
+                self.last_scrollback_growth = Some(Instant::now());
+            }
+        }
 
         // Process sync blocks for history management
         let mut pos = 0;
@@ -792,19 +810,40 @@ impl Proxy {
         Ok(())
     }
 
-    /// After a settled resize, once the child's repaint has gone quiet, rewrite the
-    /// terminal scrollback from the emulator so it holds one reflowed copy of the history
-    fn check_resize_refresh<F: AsFd>(&mut self, stdout_fd: &F) -> Result<()> {
-        let Some(due) = self.resize_refresh_due else {
-            return Ok(());
-        };
-        let now = Instant::now();
-        if now < due
-            || self.in_lookback_mode
+    /// Rows the emulator holds above its screen
+    fn scrollback_rows(&mut self) -> usize {
+        let screen = self.vt_parser.screen_mut();
+        screen.set_scrollback(usize::MAX);
+        let rows = screen.scrollback();
+        screen.set_scrollback(0);
+        rows
+    }
+
+    /// Rewrite the terminal scrollback from the emulator so it holds one copy of the
+    /// history: once after startup, when the history has grown (the transcript a
+    /// resumed session prints) and then stopped growing, which a spinner never
+    /// changes; and after a settled resize, once the child's repaint has gone quiet
+    fn check_scrollback_refresh<F: AsFd>(&mut self, stdout_fd: &F) -> Result<()> {
+        if self.in_lookback_mode
             || self.in_alternate_screen
             || self.in_sync_block
             || self.winch_pending_since.is_some()
         {
+            return Ok(());
+        }
+        if self.startup_refresh_pending
+            && let Some(grown) = self.last_scrollback_growth
+            && grown.elapsed() >= self.startup_refresh_quiet
+        {
+            self.startup_refresh_pending = false;
+            debug!("startup refresh: rewriting scrollback from the emulator");
+            return self.dump_history(stdout_fd);
+        }
+        let Some(due) = self.resize_refresh_due else {
+            return Ok(());
+        };
+        let now = Instant::now();
+        if now < due {
             return Ok(());
         }
         // Wait for the child's repaint to go quiet, but not forever: a spinner never does
