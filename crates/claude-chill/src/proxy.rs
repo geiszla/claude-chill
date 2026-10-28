@@ -97,6 +97,7 @@ impl Drop for TerminalGuard {
 const RENDER_DELAY_MS: u64 = 5;
 const SYNC_BLOCK_DELAY_MS: u64 = 50;
 const RESIZE_DEBOUNCE_MS: u64 = 150;
+const RESIZE_REFRESH_MAX_WAIT_MS: u64 = 1500;
 
 pub struct Proxy {
     config: ProxyConfig,
@@ -387,6 +388,7 @@ impl Proxy {
             }
 
             self.flush_pending_vt_render(&stdout_fd)?;
+            self.check_resize_refresh(&stdout_fd)?;
 
             if let Some(revents) = poll_fds[0].revents() {
                 if revents.contains(PollFlags::POLLIN) {
@@ -796,7 +798,8 @@ impl Proxy {
         let Some(due) = self.resize_refresh_due else {
             return Ok(());
         };
-        if Instant::now() < due
+        let now = Instant::now();
+        if now < due
             || self.in_lookback_mode
             || self.in_alternate_screen
             || self.in_sync_block
@@ -804,10 +807,11 @@ impl Proxy {
         {
             return Ok(());
         }
-        if self
+        // Wait for the child's repaint to go quiet, but not forever: a spinner never does
+        let quiet = self
             .last_output_time
-            .is_some_and(|t| t.elapsed() < Duration::from_millis(RESIZE_DEBOUNCE_MS))
-        {
+            .is_none_or(|t| t.elapsed() >= Duration::from_millis(RESIZE_DEBOUNCE_MS));
+        if !quiet && now < due + Duration::from_millis(RESIZE_REFRESH_MAX_WAIT_MS) {
             return Ok(());
         }
         self.resize_refresh_due = None;
