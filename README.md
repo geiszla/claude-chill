@@ -1,6 +1,6 @@
 # claude-chill
 
-[![CI](https://github.com/davidbeesley/claude-chill/actions/workflows/ci.yml/badge.svg)](https://github.com/davidbeesley/claude-chill/actions/workflows/ci.yml)
+[![CI](https://github.com/geiszla/claude-chill/actions/workflows/ci.yml/badge.svg)](https://github.com/geiszla/claude-chill/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 ![Version](https://img.shields.io/badge/version-0.1.4-blue)
 ![Linux](https://img.shields.io/badge/Linux-supported-green)
@@ -9,6 +9,14 @@
 ![Rust](https://img.shields.io/badge/rust-2024-orange)
 
 A PTY proxy that tames Claude Code's massive terminal updates using VT-based rendering.
+
+This is a fork of [davidbeesley/claude-chill](https://github.com/davidbeesley/claude-chill), adapted to Claude Code's current inline renderer. It differs from upstream in these ways:
+
+- Rows that scroll off the screen reach your terminal's native scrollback as they leave, so you can scroll up and read while Claude works.
+- Lookback writes the emulator's history, each row once as last rendered, instead of replaying raw output, which repeated every partial repaint.
+- Resizes reach Claude once they settle, and the scrollback is then rewritten clean at the new size.
+- The screen is never cleared with `ESC[2J`, which VS Code's terminal scrolls into the scrollback instead of erasing.
+- A lone Esc is not held back when the lookback key starts with Esc.
 
 ## The Problem
 
@@ -29,7 +37,7 @@ claude-chill sits between your terminal and Claude Code:
 ## Installation
 
 ```bash
-cargo install --git https://github.com/davidbeesley/claude-chill
+cargo install --git https://github.com/geiszla/claude-chill
 ```
 
 Or, if you've cloned the repository locally:
@@ -190,17 +198,17 @@ claude-chill creates a pseudo-terminal (PTY) and spawns Claude Code as a child p
 
 ```bash
 # Install directly from GitHub
-nix profile install github:davidbeesley/claude-chill
+nix profile install github:geiszla/claude-chill
 
 # Or run without installing
-nix run github:davidbeesley/claude-chill -- --help
+nix run github:geiszla/claude-chill -- --help
 ```
 
 ### NixOS
 
 Add the following to your `flake.nix`:
 ```nix
-inputs.claude-chill.url = "github:davidbeesley/claude-chill";
+inputs.claude-chill.url = "github:geiszla/claude-chill";
 ```
 
 And then the following package to your environment.systemPackages or home.packages:
