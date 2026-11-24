@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/geiszla/claude-chill/actions/workflows/ci.yml/badge.svg)](https://github.com/geiszla/claude-chill/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-![Version](https://img.shields.io/badge/version-0.1.4-blue)
+![Version](https://img.shields.io/badge/version-0.1.5-blue)
 ![Linux](https://img.shields.io/badge/Linux-supported-green)
 ![macOS](https://img.shields.io/badge/macOS-supported-green)
 ![Windows](https://img.shields.io/badge/Windows-unsupported-red)
@@ -14,7 +14,7 @@ This is a fork of [davidbeesley/claude-chill](https://github.com/davidbeesley/cl
 
 - Rows that scroll off the screen reach your terminal's native scrollback as they leave, so you can scroll up and read while Claude works.
 - Lookback writes the emulator's history, each row once as last rendered, instead of replaying raw output, which repeated every partial repaint.
-- Resizes reach Claude once they settle, and the scrollback is then rewritten clean at the new size.
+- Resizes reach Claude once they settle, and the scrollback is then rewritten clean at the new size. After a width change Claude is asked to print its transcript again, so the rows above the screen are wrapped for the new width too.
 - The screen is never cleared with `ESC[2J`, which VS Code's terminal scrolls into the scrollback instead of erasing.
 - A lone Esc is not held back when the lookback key starts with Esc.
 
@@ -117,7 +117,7 @@ Press `Ctrl+6` (or your configured key) to enter lookback mode:
 
 When you exit lookback mode, any cached output is processed and the live screen is repainted over the end of the dump, so the dump stays in your scrollback until the next one.
 
-Claude Code repaints by moving the cursor home and rewriting the visible rows, so the emulator's history holds no partial repaints. What it cannot undo is Claude's own repaint after a resize, which re-emits the rows around the old screen boundary at the new width: expect a seam of a few duplicated lines per resize.
+Claude Code repaints by moving the cursor home and rewriting the visible rows, so the emulator's history holds no partial repaints. A row that Claude changes after it has scrolled off the screen (for example tool output that it collapses later) stays in the history as it was when it left.
 
 ## Auto-Lookback
 
@@ -130,9 +130,14 @@ The live rendering scrolls rows into your terminal's own scrollback as they leav
 - **Lookback** (the key above), on demand.
 - **After a resize**: window resizes are forwarded to Claude only once they settle (150 ms without a change), so a drag causes one repaint. `resize_refresh_ms` (default 500) after that, once Claude's output has gone quiet or at the latest 1.5 s later, the scrollback is rewritten at the new size. Set it to 0 to disable.
 
+  After a resize Claude repaints only the visible rows, with the last rows of its transcript. What the rewrite uses depends on what changed:
+
+  - **Height only**: the emulator moves rows between its history and its screen, so that the screen again holds the last rows. The history stays complete.
+  - **Width**: the rows above the screen would keep their old wrapping, and only Claude can wrap them again. The proxy sends Claude `SIGCONT`, which makes it print its whole transcript at the new size, and that print replaces the history. It can be shorter than what had scrolled by: a resumed long session, for example, prints only its recent part.
+
 - **Once after startup**, optionally: `startup_refresh_ms` (default 0, off) rewrites the scrollback when the emulator's history has grown and then stayed unchanged that long. The live rendering already scrolls a resumed session's transcript in, so this is only for terminals where that does not work out.
 
-The emulator keeps old rows at the width they were rendered: when the terminal is narrower than those rows, your terminal wraps them. A rewrite replaces the whole scrollback, so it is not done while you may be reading it, which is why there is no periodic refresh. Once the emulator's scrollback is full (`history_lines`), the number of rows that scrolled is unknown and the screen is repainted in place until the next rewrite.
+With `resize_refresh_ms = 0` nothing is printed again and the emulator keeps old rows at the width they were rendered: when the terminal is narrower than those rows, your terminal wraps them. A rewrite replaces the whole scrollback, so it is not done while you may be reading it, which is why there is no periodic refresh. Once the emulator's scrollback is full (`history_lines`), the number of rows that scrolled is unknown and the screen is repainted in place until the next rewrite.
 
 ## Configuration
 

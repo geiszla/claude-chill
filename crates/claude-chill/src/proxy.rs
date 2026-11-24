@@ -15,6 +15,7 @@ use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, kill, sig
 use nix::sys::termios::{SetArg, Termios, cfmakeraw, tcgetattr, tcsetattr};
 use nix::unistd::{Pid, isatty, read, write};
 use std::io;
+use std::num::NonZeroU16;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, ExitStatus};
@@ -111,6 +112,8 @@ pub struct Proxy {
     shadow: vt100::Parser,
     force_full_render: bool,
     scrollback_rows_at_render: usize,
+    reprint_dump_pending: bool,
+    resize_changed_width: bool,
     last_output_time: Option<Instant>,
     last_render_time: Option<Instant>,
     last_stdin_time: Option<Instant>,
@@ -282,8 +285,11 @@ impl Proxy {
         let stdout_fd = io::stdout();
         write_all(&stdout_fd, BRACKETED_PASTE_ENABLE)?;
 
-        let vt_parser =
-            vt100::Parser::new(winsize.ws_row, winsize.ws_col, config.max_history_lines);
+        let vt_parser = vt100::Parser::new(
+            nonzero(winsize.ws_row),
+            nonzero(winsize.ws_col),
+            config.max_history_lines,
+        );
 
         // Seed history with clear screen so replay starts fresh
         let auto_lookback_timeout = Duration::from_millis(config.auto_lookback_timeout_ms);
@@ -298,9 +304,11 @@ impl Proxy {
             child,
             original_termios: terminal_guard.take(),
             vt_parser,
-            shadow: vt100::Parser::new(winsize.ws_row, winsize.ws_col, 0),
+            shadow: vt100::Parser::new(nonzero(winsize.ws_row), nonzero(winsize.ws_col), 0),
             force_full_render: true,
             scrollback_rows_at_render: 0,
+            reprint_dump_pending: false,
+            resize_changed_width: false,
             last_output_time: None,
             last_render_time: None,
             last_stdin_time: None,
@@ -686,6 +694,10 @@ impl Proxy {
         };
 
         if elapsed >= delay {
+            if self.reprint_dump_pending {
+                self.reprint_dump_pending = false;
+                return self.dump_history(stdout_fd);
+            }
             self.render_vt_screen(stdout_fd)?;
         }
 
@@ -725,8 +737,8 @@ impl Proxy {
         if full {
             self.force_full_render = false;
             let frame = self.vt_parser.screen().contents_formatted();
-            self.shadow.process(&frame);
-            self.output_buffer.extend_from_slice(&frame);
+            self.shadow.process(frame.as_bytes());
+            self.output_buffer.extend_from_slice(frame.as_bytes());
         } else {
             // Rows that left the emulator's screen since the last render leave the
             // terminal's screen the same way, so its scrollback grows with the
@@ -735,18 +747,18 @@ impl Proxy {
             // repainted in place instead.
             let k = scrolled.saturating_sub(self.scrollback_rows_at_render);
             if k > 0 && scrolled < self.config.max_history_lines {
-                let scroll = self.mirror_scroll(k, usize::from(rows), cols);
+                let scroll = self.mirror_scroll(k, usize::from(rows.get()), cols.get());
                 self.shadow.process(&scroll);
                 self.output_buffer.extend_from_slice(&scroll);
             }
             let diff = self.vt_parser.screen().contents_diff(self.shadow.screen());
-            self.shadow.process(&diff);
-            self.output_buffer.extend_from_slice(&diff);
+            self.shadow.process(diff.as_bytes());
+            self.output_buffer.extend_from_slice(diff.as_bytes());
         }
 
         let cursor = self.vt_parser.screen().cursor_state_formatted();
-        self.shadow.process(&cursor);
-        self.output_buffer.extend_from_slice(&cursor);
+        self.shadow.process(cursor.as_bytes());
+        self.output_buffer.extend_from_slice(cursor.as_bytes());
         self.output_buffer.extend_from_slice(SYNC_END);
 
         debug!(
@@ -781,7 +793,7 @@ impl Proxy {
             .shadow
             .screen()
             .rows_formatted(0, cols)
-            .map(|row| row.strip_prefix(b"\r\n").unwrap_or(&row).to_vec())
+            .map(|row| row.strip_prefix("\r\n").unwrap_or(&row).as_bytes().to_vec())
             .collect();
         let mut out = Vec::new();
         for i in 0..k.min(n) {
@@ -846,8 +858,25 @@ impl Proxy {
             return Ok(());
         }
         self.resize_refresh_due = None;
+        // A height change only moves rows between the emulator's scrollback and screen.
+        // A width change makes Claude Code wrap its rows again, which only it can do.
+        if std::mem::take(&mut self.resize_changed_width) {
+            debug!("resize refresh: asking the child to print its transcript again");
+            self.request_reprint();
+            return Ok(());
+        }
         debug!("resize refresh: rewriting scrollback from the emulator");
         self.dump_history(stdout_fd)
+    }
+
+    /// On SIGCONT Claude Code prints its whole transcript again from the cursor: a new
+    /// emulator takes that as the history, and the next render writes it to the terminal.
+    fn request_reprint(&mut self) {
+        let (rows, cols) = self.vt_parser.screen().size();
+        self.vt_parser = vt100::Parser::new(rows, cols, self.config.max_history_lines);
+        self.scrollback_rows_at_render = 0;
+        self.reprint_dump_pending = true;
+        self.forward_signal(Signal::SIGCONT);
     }
 
     fn check_auto_lookback<F: AsFd>(&mut self, stdout_fd: &F) -> Result<()> {
@@ -897,7 +926,7 @@ impl Proxy {
     /// emulator does not reflow); a width of `u16::MAX` emits all their cells so the
     /// terminal wraps them
     fn stream_rows(&mut self, from: usize, width: u16) -> Vec<Vec<u8>> {
-        let rows = usize::from(self.vt_parser.screen().size().0);
+        let rows = usize::from(self.vt_parser.screen().size().0.get());
         let screen = self.vt_parser.screen_mut();
         screen.set_scrollback(usize::MAX);
         let top = screen.scrollback();
@@ -915,7 +944,7 @@ impl Proxy {
                 next = index + 1;
                 if index >= from {
                     // A wrapped continuation row starts with its own line break
-                    out.push(row.strip_prefix(b"\r\n").unwrap_or(&row).to_vec());
+                    out.push(row.strip_prefix("\r\n").unwrap_or(&row).as_bytes().to_vec());
                 }
             }
             if offset == 0 {
@@ -1221,13 +1250,10 @@ impl Proxy {
                 "forward_winsize: rows={} cols={}",
                 winsize.ws_row, winsize.ws_col
             );
-            // Resize VT emulator
-            self.vt_parser
-                .screen_mut()
-                .set_size(winsize.ws_row, winsize.ws_col);
-            self.shadow
-                .screen_mut()
-                .set_size(winsize.ws_row, winsize.ws_col);
+            let (rows, cols) = (nonzero(winsize.ws_row), nonzero(winsize.ws_col));
+            self.resize_changed_width |= cols != self.vt_parser.screen().size().1;
+            resize_emulator(&mut self.vt_parser, rows, cols);
+            self.shadow.screen_mut().set_size(rows, cols);
             // Force full render on next frame since size changed
             self.force_full_render = true;
             // Forward to child process
@@ -1265,6 +1291,32 @@ impl Drop for Proxy {
             let _ = tcsetattr(io::stdin(), SetArg::TCSANOW, termios);
         }
     }
+}
+
+fn nonzero(v: u16) -> NonZeroU16 {
+    NonZeroU16::new(v).unwrap_or(NonZeroU16::MIN)
+}
+
+/// Resize the emulator so that Claude Code's frame stays on the last rows of the
+/// screen, which is where Claude Code repaints it. On a shrink vt100 drops the rows
+/// below the cursor before it moves rows into scrollback, and Claude Code rests its
+/// cursor above the end of its frame (one row past its last text row). With the cursor
+/// moved there first, only rows outside the frame are dropped.
+fn resize_emulator(parser: &mut vt100::Parser, rows: NonZeroU16, cols: NonZeroU16) {
+    let (old_rows, old_cols) = parser.screen().size();
+    if rows < old_rows {
+        let text_rows = parser
+            .screen()
+            .rows(0, old_cols.get())
+            .enumerate()
+            .filter(|(_, row)| !row.trim().is_empty())
+            .map(|(i, _)| i + 1)
+            .last()
+            .unwrap_or(0);
+        let frame_end = (text_rows + 1).min(usize::from(old_rows.get()));
+        parser.process(format!("\x1b[{frame_end};1H").as_bytes());
+    }
+    parser.screen_mut().set_size(rows, cols);
 }
 
 fn get_terminal_size() -> Result<Winsize> {
@@ -1441,6 +1493,50 @@ mod tests {
                 }
             }
         }
+    }
+
+    // Tests for the emulator resize
+
+    /// 12 text rows and the blank row after them on a 10-row screen, cursor 3 rows above
+    /// the end of the frame, as Claude Code leaves it
+    fn parser_with_frame() -> vt100::Parser {
+        let mut parser = vt100::Parser::new(nonzero(10), nonzero(20), 100);
+        for i in 0..12 {
+            parser.process(format!("row {i}\r\n").as_bytes());
+        }
+        parser.process(b"\x1b[3A");
+        parser
+    }
+
+    fn top_row(parser: &vt100::Parser) -> String {
+        parser.screen().rows(0, 20).next().unwrap()
+    }
+
+    #[test]
+    fn test_resize_shrink_keeps_the_end_of_the_frame() {
+        let mut parser = parser_with_frame();
+        assert_eq!(parser.screen().scrollback_len(), 3);
+        resize_emulator(&mut parser, nonzero(6), nonzero(20));
+        assert_eq!(parser.screen().scrollback_len(), 7);
+        assert_eq!(top_row(&parser), "row 7");
+    }
+
+    #[test]
+    fn test_resize_grow_takes_rows_back_from_scrollback() {
+        let mut parser = parser_with_frame();
+        resize_emulator(&mut parser, nonzero(6), nonzero(20));
+        resize_emulator(&mut parser, nonzero(12), nonzero(20));
+        assert_eq!(parser.screen().scrollback_len(), 1);
+        assert_eq!(top_row(&parser), "row 1");
+    }
+
+    #[test]
+    fn test_resize_shrink_of_a_short_frame_drops_only_blank_rows() {
+        let mut parser = vt100::Parser::new(nonzero(10), nonzero(20), 100);
+        parser.process(b"row 0\r\nrow 1\r\n");
+        resize_emulator(&mut parser, nonzero(4), nonzero(20));
+        assert_eq!(parser.screen().scrollback_len(), 0);
+        assert_eq!(top_row(&parser), "row 0");
     }
 
     // Tests for Kitty keyboard protocol tracking
