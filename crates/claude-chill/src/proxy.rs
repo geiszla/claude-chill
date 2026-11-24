@@ -98,6 +98,7 @@ impl Drop for TerminalGuard {
 const RENDER_DELAY_MS: u64 = 5;
 const SYNC_BLOCK_DELAY_MS: u64 = 50;
 const RESIZE_DEBOUNCE_MS: u64 = 150;
+const RESIZE_FORWARD_MAX_WAIT_MS: u64 = 1000;
 const RESIZE_REFRESH_MAX_WAIT_MS: u64 = 1500;
 // A lone Esc is a prefix of an Esc-based lookback key; forward it after this long
 const LOOKBACK_HOLD_MS: u64 = 50;
@@ -357,9 +358,13 @@ impl Proxy {
                 self.winch_pending_since = Some(Instant::now());
             }
             // A drag fires many resizes. The child only gets the settled size, so it
-            // repaints once and leaves one seam in the history instead of one per event.
+            // repaints once. It gets it between two of its frames: inside one, the
+            // cursor move in resize_emulator would cut the frame in two. The end of a
+            // frame is missed when it is split across two reads, so the wait is bounded.
             if let Some(since) = self.winch_pending_since
                 && since.elapsed() >= Duration::from_millis(RESIZE_DEBOUNCE_MS)
+                && (!self.in_sync_block
+                    || since.elapsed() >= Duration::from_millis(RESIZE_FORWARD_MAX_WAIT_MS))
             {
                 self.winch_pending_since = None;
                 self.forward_winsize()?;
